@@ -1,0 +1,1769 @@
+import os
+import json
+import asyncio
+import threading
+import time
+from datetime import datetime
+from collections import deque
+import logging
+import numpy as np
+import pyaudio
+import wave
+import struct
+import math
+
+# Flask and WebSocket imports
+from flask import Flask, render_template, request, jsonify
+from flask_socketio import SocketIO, emit
+import eventlet
+eventlet.monkey_patch()
+
+# Original Alpha AI imports
+import pyttsx3
+import speech_recognition as sr
+import wikipedia
+import webbrowser
+from openai import OpenAI
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class AdvancedWakeWordDetector:
+    """Enhanced wake word detector with multiple algorithms"""
+    
+    def __init__(self, wake_words=["alpha", "hey alpha"], threshold=0.3, sample_rate=16000):
+        self.wake_words = [word.lower() for word in wake_words]
+        self.threshold = threshold
+        self.sample_rate = sample_rate
+        self.chunk = 1024
+        self.format = pyaudio.paInt16
+        self.channels = 1
+        self.audio = pyaudio.PyAudio()
+        self.is_listening = False
+        self.energy_history = deque(maxlen=100)
+        self.detection_callback = None
+        
+    def get_energy(self, audio_data):
+        """Calculate energy of audio data with improved algorithm"""
+        try:
+            audio_np = np.frombuffer(audio_data, dtype=np.int16)
+            # Use RMS energy calculation
+            energy = np.sqrt(np.mean(audio_np**2))
+            return energy
+        except Exception as e:
+            logging.error(f"Energy calculation error: {e}")
+            return 0
+    
+    def detect_speech_activity(self, energy):
+        """Detect speech activity using energy-based VAD"""
+        if len(self.energy_history) < 10:
+            return False
+            
+        avg_energy = sum(self.energy_history) / len(self.energy_history)
+        return energy > avg_energy * 2.5
+    
+    def start_detection(self, callback):
+        """Start wake word detection"""
+        self.detection_callback = callback
+        self.is_listening = True
+        
+        def detection_thread():
+            stream = self.audio.open(
+                format=self.format,
+                channels=self.channels,
+                rate=self.sample_rate,
+                input=True,
+                frames_per_buffer=self.chunk
+            )
+            
+            recognizer = sr.Recognizer()
+            recognizer.energy_threshold = 4000
+            recognizer.dynamic_energy_threshold = True
+            recognizer.pause_threshold = 0.8
+            
+            while self.is_listening:
+                try:
+                    # Read audio data
+                    data = stream.read(self.chunk, exception_on_overflow=False)
+                    energy = self.get_energy(data)
+                    self.energy_history.append(energy)
+                    
+                    # Check for speech activity
+                    if self.detect_speech_activity(energy):
+                        try:
+                            # Capture longer audio sample
+                            frames = []
+                            for _ in range(int(self.sample_rate / self.chunk * 3)):  # 3 seconds
+                                data = stream.read(self.chunk, exception_on_overflow=False)
+                                frames.append(data)
+                            
+                            # Convert to audio data
+                            audio_data = b''.join(frames)
+                            audio_source = sr.AudioData(audio_data, self.sample_rate, 2)
+                            
+                            # Recognize speech
+                            text = recognizer.recognize_google(audio_source, language='en-US')
+                            text = text.lower()
+                            
+                            logging.info(f"Detected speech: {text}")
+                            
+                            # Check for wake words
+                            for wake_word in self.wake_words:
+                                if wake_word in text:
+                                    logging.info(f"Wake word detected: {wake_word}")
+                                    if self.detection_callback:
+                                        self.detection_callback(wake_word, text)
+                                    break
+                                    
+                        except sr.UnknownValueError:
+                            pass
+                        except sr.RequestError as e:
+                            logging.error(f"Speech recognition error: {e}")
+                        except Exception as e:
+                            logging.error(f"Recognition error: {e}")
+                            
+                except Exception as e:
+                    logging.error(f"Wake word detection error: {e}")
+                    
+            stream.stop_stream()
+            stream.close()
+        
+        thread = threading.Thread(target=detection_thread, daemon=True)
+        thread.start()
+    
+    def stop_detection(self):
+        """Stop wake word detection"""
+        self.is_listening = False
+        try:
+            self.audio.terminate()
+        except:
+            pass
+
+class EnhancedAlphaAI:
+    """Enhanced Alpha AI with web interface and advanced features"""
+    
+    def __init__(self):
+        # Initialize OpenAI client
+        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        
+        # Initialize TTS engine
+        self.tts_engine = pyttsx3.init()
+        self.setup_voice()
+        
+        # Initialize wake word detector
+        self.wake_word_detector = AdvancedWakeWordDetector()
+        self.is_wake_word_active = False
+        
+        # Conversation history
+        self.conversation_history = []
+        self.max_history = 10
+        
+        # System status
+        self.system_status = {
+            'status': 'READY',
+            'wake_word': 'INACTIVE',
+            'voice': 'ENABLED',
+            'processing': False,
+            'last_interaction': datetime.now().isoformat()
+        }
+        
+        # Initialize Flask app
+        self.app = Flask(__name__)
+        self.app.config['SECRET_KEY'] = 'alpha_ai_secret_key_2024'
+        self.socketio = SocketIO(self.app, cors_allowed_origins="*", async_mode='eventlet')
+        
+        self.setup_routes()
+        self.setup_socket_events()
+    
+    def setup_voice(self):
+        """Setup TTS voice properties"""
+        try:
+            voices = self.tts_engine.getProperty("voices")
+            if voices:
+                # Try to find a female voice
+                for voice in voices:
+                    if 'female' in voice.name.lower() or 'zira' in voice.name.lower():
+                        self.tts_engine.setProperty('voice', voice.id)
+                        break
+                else:
+                    # Use second voice if available, otherwise first
+                    self.tts_engine.setProperty('voice', voices[1].id if len(voices) > 1 else voices[0].id)
+            
+            self.tts_engine.setProperty('rate', 160)
+            self.tts_engine.setProperty('volume', 0.9)
+        except Exception as e:
+            logging.error(f"Voice setup error: {e}")
+    
+    def setup_routes(self):
+        """Setup Flask routes"""
+        
+        @self.app.route('/')
+        def index():
+            return self.get_html_template()
+        
+        @self.app.route('/api/status')
+        def get_status():
+            return jsonify(self.system_status)
+        
+        @self.app.route('/api/conversation')
+        def get_conversation():
+            return jsonify(self.conversation_history)
+    
+    def setup_socket_events(self):
+        """Setup WebSocket events"""
+        
+        @self.socketio.on('connect')
+        def handle_connect():
+            logging.info("Client connected")
+            emit('status_update', self.system_status)
+            emit('conversation_history', self.conversation_history)
+        
+        @self.socketio.on('disconnect')
+        def handle_disconnect():
+            logging.info("Client disconnected")
+        
+        @self.socketio.on('send_message')
+        def handle_message(data):
+            message = data.get('message', '').strip()
+            if message:
+                self.process_text_message(message)
+        
+        @self.socketio.on('toggle_wake_word')
+        def handle_toggle_wake_word():
+            self.toggle_wake_word()
+        
+        @self.socketio.on('listen_once')
+        def handle_listen_once():
+            self.listen_once()
+        
+        @self.socketio.on('clear_chat')
+        def handle_clear_chat():
+            self.clear_conversation()
+        
+        @self.socketio.on('stop_speaking')
+        def handle_stop_speaking():
+            self.stop_speaking()
+    
+    def process_text_message(self, message):
+        """Process text message from user"""
+        self.add_to_conversation("user", message)
+        self.socketio.emit('message_received', {
+            'sender': 'user',
+            'message': message,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        # Process in background thread
+        def process_thread():
+            response = self.handle_query(message.lower())
+            self.add_to_conversation("ai", response)
+            
+            self.socketio.emit('message_received', {
+                'sender': 'ai',
+                'message': response,
+                'timestamp': datetime.now().isoformat()
+            })
+            
+            # Speak the response
+            self.speak_async(response)
+        
+        thread = threading.Thread(target=process_thread, daemon=True)
+        thread.start()
+    
+    def handle_query(self, query):
+        """Enhanced query handling with more capabilities"""
+        self.update_status('PROCESSING')
+        
+        try:
+            # Handle different types of queries
+            if any(word in query for word in ['wikipedia', 'wiki', 'search about']):
+                return self.handle_wikipedia_query(query)
+            elif 'who are you' in query or 'what are you' in query:
+                return "I am Alpha, an advanced AI assistant developed by Animesh Paramanik. I'm equipped with natural language processing, voice recognition, and can help you with various tasks including web searches, answering questions, and general assistance."
+            elif 'time' in query:
+                return f"The current time is {datetime.now().strftime('%I:%M %p')}"
+            elif 'date' in query:
+                return f"Today is {datetime.now().strftime('%A, %B %d, %Y')}"
+            elif any(word in query for word in ['open youtube', 'youtube']):
+                self.open_website("YouTube", "https://www.youtube.com")
+                return "Opening YouTube for you. You can now browse videos and content."
+            elif any(word in query for word in ['open google', 'google']):
+                self.open_website("Google", "https://www.google.com")
+                return "Opening Google search for you."
+            elif any(word in query for word in ['open github', 'github']):
+                self.open_website("GitHub", "https://github.com")
+                return "Opening GitHub for you to explore repositories and code."
+            elif any(word in query for word in ['music', 'play music', 'spotify']):
+                self.open_website("Spotify", "https://open.spotify.com/")
+                return "Opening Spotify for you. Enjoy your music!"
+            elif any(word in query for word in ['news', 'latest news']):
+                self.open_website("BBC News", "https://www.bbc.com/news")
+                return "Opening BBC News for you to stay updated with current events."
+            elif any(word in query for word in ['weather']):
+                return "I don't have access to real-time weather data, but I recommend checking your local weather service or opening a weather website."
+            elif any(word in query for word in ['exit', 'goodbye', 'quit', 'stop']):
+                return "Goodbye! It was great talking with you. Have a wonderful day!"
+            elif any(word in query for word in ['thank', 'thanks']):
+                return "You're very welcome! I'm always here to help you with whatever you need."
+            elif 'joke' in query:
+                jokes = [
+                    "Why don't scientists trust atoms? Because they make up everything!",
+                    "I told my wife she was drawing her eyebrows too high. She looked surprised.",
+                    "Why don't programmers like nature? It has too many bugs!",
+                    "I'm reading a book about anti-gravity. It's impossible to put down!"
+                ]
+                import random
+                return random.choice(jokes)
+            else:
+                return self.ask_gpt(query)
+        except Exception as e:
+            logging.error(f"Query handling error: {e}")
+            return "I encountered an error while processing your request. Please try again."
+        finally:
+            self.update_status('READY')
+    
+    def handle_wikipedia_query(self, query):
+        """Enhanced Wikipedia search"""
+        try:
+            # Clean the query
+            query = query.replace("wikipedia", "").replace("wiki", "").replace("search about", "").strip()
+            if not query:
+                return "Please specify what you'd like me to search for on Wikipedia."
+            
+            # Search Wikipedia
+            results = wikipedia.summary(query, sentences=3)
+            return f"Here's what I found on Wikipedia about {query}: {results}"
+        except wikipedia.exceptions.DisambiguationError as e:
+            # Handle disambiguation
+            suggestions = e.options[:3]  # Get first 3 suggestions
+            return f"I found multiple topics for '{query}'. Did you mean: {', '.join(suggestions)}? Please be more specific."
+        except wikipedia.exceptions.PageError:
+            return f"I couldn't find any Wikipedia page for '{query}'. Please try a different search term."
+        except Exception as e:
+            logging.error(f"Wikipedia search error: {e}")
+            return "I encountered an error while searching Wikipedia. Please try again."
+    
+    def ask_gpt(self, prompt):
+        """Enhanced OpenAI GPT integration"""
+        try:
+            # Build conversation context
+            messages = [
+                {
+                    "role": "system", 
+                    "content": """You are Alpha, an advanced AI assistant developed by Animesh Paramanik. 
+                    You are helpful, intelligent, and have a slightly futuristic personality. 
+                    Provide clear, concise answers that can be easily spoken aloud. 
+                    Keep responses under 200 words when possible, but be thorough and helpful.
+                    You have access to voice synthesis and can interact naturally with users."""
+                }
+            ]
+            
+            # Add recent conversation history for context
+            for entry in self.conversation_history[-6:]:  # Last 6 messages
+                role = "user" if entry['sender'] == 'user' else "assistant"
+                messages.append({"role": role, "content": entry['message']})
+            
+            # Add current prompt
+            messages.append({"role": "user", "content": prompt})
+            
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                max_tokens=300,
+                temperature=0.7,
+                top_p=0.9
+            )
+            
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logging.error(f"OpenAI error: {e}")
+            return "I'm having trouble connecting to my knowledge base right now. Please try again in a moment."
+    
+    def open_website(self, name, url):
+        """Open website with error handling"""
+        try:
+            webbrowser.open(url)
+            logging.info(f"Opened {name}: {url}")
+        except Exception as e:
+            logging.error(f"Error opening {name}: {e}")
+    
+    def speak_async(self, text):
+        """Asynchronous text-to-speech"""
+        def speak_thread():
+            try:
+                self.tts_engine.say(text)
+                self.tts_engine.runAndWait()
+            except Exception as e:
+                logging.error(f"TTS error: {e}")
+        
+        thread = threading.Thread(target=speak_thread, daemon=True)
+        thread.start()
+    
+    def stop_speaking(self):
+        """Stop current speech"""
+        try:
+            self.tts_engine.stop()
+        except Exception as e:
+            logging.error(f"Stop speaking error: {e}")
+    
+    def listen_once(self):
+        """Listen for a single voice command"""
+        def listen_thread():
+            self.update_status('LISTENING')
+            self.socketio.emit('listening_started')
+            
+            try:
+                recognizer = sr.Recognizer()
+                with sr.Microphone() as source:
+                    recognizer.adjust_for_ambient_noise(source, duration=1)
+                    self.socketio.emit('listening_ready')
+                    
+                    audio = recognizer.listen(source, timeout=10, phrase_time_limit=8)
+                    
+                self.socketio.emit('processing_audio')
+                query = recognizer.recognize_google(audio, language='en-US')
+                
+                if query:
+                    logging.info(f"Voice command recognized: {query}")
+                    self.process_text_message(query)
+                else:
+                    self.socketio.emit('listening_failed', {'error': 'No speech detected'})
+                    
+            except sr.WaitTimeoutError:
+                self.socketio.emit('listening_failed', {'error': 'Listening timeout'})
+            except sr.UnknownValueError:
+                self.socketio.emit('listening_failed', {'error': 'Could not understand audio'})
+            except sr.RequestError as e:
+                self.socketio.emit('listening_failed', {'error': f'Recognition service error: {e}'})
+            except Exception as e:
+                logging.error(f"Listen once error: {e}")
+                self.socketio.emit('listening_failed', {'error': 'An error occurred'})
+            finally:
+                self.update_status('READY')
+                self.socketio.emit('listening_stopped')
+        
+        thread = threading.Thread(target=listen_thread, daemon=True)
+        thread.start()
+    
+    def toggle_wake_word(self):
+        """Toggle wake word detection"""
+        if not self.is_wake_word_active:
+            self.start_wake_word_detection()
+        else:
+            self.stop_wake_word_detection()
+    
+    def start_wake_word_detection(self):
+        """Start wake word detection"""
+        self.is_wake_word_active = True
+        self.system_status['wake_word'] = 'ACTIVE'
+        self.update_status('LISTENING FOR WAKE WORD')
+        
+        def wake_word_callback(wake_word, full_text):
+            logging.info(f"Wake word '{wake_word}' detected in: {full_text}")
+            self.socketio.emit('wake_word_detected', {
+                'wake_word': wake_word,
+                'full_text': full_text
+            })
+            # Extract command after wake word
+            command = full_text.replace(wake_word, "").strip()
+            if command:
+                self.process_text_message(command)
+            else:
+                self.listen_once()
+        
+        self.wake_word_detector.start_detection(wake_word_callback)
+        self.socketio.emit('wake_word_status', {'active': True})
+    
+    def stop_wake_word_detection(self):
+        """Stop wake word detection"""
+        self.is_wake_word_active = False
+        self.system_status['wake_word'] = 'INACTIVE'
+        self.wake_word_detector.stop_detection()
+        self.update_status('READY')
+        self.socketio.emit('wake_word_status', {'active': False})
+    
+    def add_to_conversation(self, sender, message):
+        """Add message to conversation history"""
+        entry = {
+            'sender': sender,
+            'message': message,
+            'timestamp': datetime.now().isoformat()
+        }
+        self.conversation_history.append(entry)
+        
+        # Keep only recent messages
+        if len(self.conversation_history) > self.max_history * 2:
+            self.conversation_history = self.conversation_history[-self.max_history:]
+    
+    def clear_conversation(self):
+        """Clear conversation history"""
+        self.conversation_history.clear()
+        self.socketio.emit('conversation_cleared')
+    
+    def update_status(self, status):
+        """Update system status"""
+        self.system_status['status'] = status
+        self.system_status['last_interaction'] = datetime.now().isoformat()
+        self.socketio.emit('status_update', self.system_status)
+    
+    def get_html_template(self):
+        """Return the enhanced HTML template"""
+        return '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Alpha AI - Advanced Neural Interface</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;500;600;700&display=swap');
+        
+        :root {
+            --primary-cyan: #00ffff;
+            --primary-blue: #0080ff;
+            --dark-bg: #000012;
+            --card-bg: rgba(0, 30, 60, 0.4);
+            --accent-glow: rgba(0, 255, 255, 0.3);
+            --text-primary: #ffffff;
+            --text-secondary: #00aaaa;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Rajdhani', 'Orbitron', monospace;
+            background: var(--dark-bg);
+            color: var(--text-primary);
+            overflow-x: hidden;
+            min-height: 100vh;
+            position: relative;
+        }
+        
+        /* Enhanced Background Effects */
+        #background {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: 
+                radial-gradient(circle at 20% 80%, rgba(0, 100, 255, 0.1) 0%, transparent 50%),
+                radial-gradient(circle at 80% 20%, rgba(0, 255, 255, 0.1) 0%, transparent 50%),
+                linear-gradient(135deg, #000012 0%, #001122 50%, #000012 100%);
+            z-index: -10;
+        }
+        
+        .neural-grid {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-image: 
+                linear-gradient(rgba(0, 255, 255, 0.03) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(0, 255, 255, 0.03) 1px, transparent 1px);
+            background-size: 60px 60px;
+            animation: neuralFlow 25s linear infinite;
+            z-index: -9;
+        }
+        
+        @keyframes neuralFlow {
+            0% { transform: translate(0, 0); }
+            100% { transform: translate(60px, 60px); }
+        }
+        
+        #particles-canvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: -8;
+        }
+        
+        /* Main Interface */
+        .main-interface {
+            position: relative;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            padding: 20px;
+            background: rgba(0, 10, 20, 0.2);
+            backdrop-filter: blur(15px);
+            z-index: 1;
+        }
+        
+        /* Enhanced Header */
+        .header-section {
+            text-align: center;
+            margin-bottom: 40px;
+            animation: headerReveal 1.5s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+        }
+        
+        @keyframes headerReveal {
+            0% { 
+                opacity: 0;
+                transform: translateY(-50px) scale(0.9);
+            }
+            100% { 
+                opacity: 1;
+                transform: translateY(0) scale(1);
+            }
+        }
+        
+        .alpha-logo {
+            font-family: 'Orbitron', monospace;
+            font-size: clamp(2.5rem, 8vw, 4rem);
+            font-weight: 900;
+            background: linear-gradient(45deg, var(--primary-cyan), var(--primary-blue), var(--primary-cyan));
+            background-size: 300% 300%;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            animation: logoGlow 4s ease-in-out infinite;
+            text-shadow: 0 0 50px var(--accent-glow);
+            margin-bottom: 15px;
+            position: relative;
+        }
+        
+        .alpha-logo::before {
+            content: '';
+            position: absolute;
+            top: -10px;
+            left: -10px;
+            right: -10px;
+            bottom: -10px;
+            background: linear-gradient(45deg, var(--primary-cyan), var(--primary-blue));
+            border-radius: 50%;
+            opacity: 0.1;
+            animation: logoHalo 3s ease-in-out infinite;
+            z-index: -1;
+        }
+        
+        @keyframes logoGlow {
+            0%, 100% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+        }
+        
+        @keyframes logoHalo {
+            0%, 100% { transform: scale(1); opacity: 0.1; }
+            50% { transform: scale(1.1); opacity: 0.2; }
+        }
+        
+        .tagline {
+            font-size: clamp(0.9rem, 2.5vw, 1.2rem);
+            color: var(--text-secondary);
+            font-weight: 400;
+            opacity: 0.9;
+            animation: taglinePulse 3s ease-in-out infinite;
+            margin-bottom: 10px;
+        }
+        
+        @keyframes taglinePulse {
+            0%, 100% { opacity: 0.9; }
+            50% { opacity: 1; }
+        }
+        
+        .dev-credit {
+            font-size: 0.9rem;
+            color: rgba(0, 255, 255, 0.6);
+            font-weight: 300;
+        }
+        
+        /* Enhanced Status Dashboard */
+        .status-dashboard {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 40px;
+            animation: dashboardSlide 1s ease-out 0.5s both;
+        }
+        
+        @keyframes dashboardSlide {
+            0% { 
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            100% { 
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        .status-card {
+            background: var(--card-bg);
+            border: 1px solid rgba(0, 255, 255, 0.2);
+            border-radius: 15px;
+            padding: 20px;
+            text-align: center;
+            backdrop-filter: blur(10px);
+            transition: all 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .status-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(0, 255, 255, 0.1), transparent);
+            transition: left 0.5s;
+        }
+        
+        .status-card:hover {
+            border-color: var(--primary-cyan);
+            box-shadow: 0 10px 30px var(--accent-glow);
+            transform: translateY(-8px) scale(1.02);
+        }
+        
+        .status-card:hover::before {
+            left: 100%;
+        }
+        
+        .status-label {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+            font-weight: 500;
+            letter-spacing: 1px;
+        }
+        
+        .status-value {
+            font-size: 1.4rem;
+            font-weight: 700;
+            color: var(--primary-cyan);
+            font-family: 'Orbitron', monospace;
+        }
+        
+        /* AI Core - Enhanced */
+        .ai-core-container {
+            display: flex;
+            justify-content: center;
+            margin: 30px 0;
+            animation: coreReveal 1.5s ease-out 1s both;
+        }
+        
+        @keyframes coreReveal {
+            0% { 
+                opacity: 0;
+                transform: scale(0.3) rotate(-180deg);
+            }
+            100% { 
+                opacity: 1;
+                transform: scale(1) rotate(0deg);
+            }
+        }
+        
+        .ai-core {
+            position: relative;
+            width: 320px;
+            height: 320px;
+        }
+        
+        .core-ring {
+            position: absolute;
+            border: 2px solid;
+            border-radius: 50%;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+        }
+        
+        .ring-1 {
+            width: 100%;
+            height: 100%;
+            border-color: rgba(0, 255, 255, 0.4);
+            animation: coreRotate 15s linear infinite;
+        }
+        
+        .ring-2 {
+            width: 80%;
+            height: 80%;
+            border-color: rgba(0, 128, 255, 0.6);
+            animation: coreRotate 12s linear infinite reverse;
+        }
+        
+        .ring-3 {
+            width: 60%;
+            height: 60%;
+            border-color: rgba(0, 255, 255, 0.8);
+            animation: coreRotate 8s linear infinite;
+        }
+        
+        .core-nucleus {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 120px;
+            height: 120px;
+            background: radial-gradient(circle, var(--primary-cyan) 0%, rgba(0, 255, 255, 0.3) 70%, transparent 100%);
+            border-radius: 50%;
+            animation: nucleusPulse 2s ease-in-out infinite;
+            box-shadow: 
+                0 0 40px var(--accent-glow),
+                inset 0 0 40px rgba(0, 255, 255, 0.2);
+        }
+        
+        @keyframes coreRotate {
+            0% { transform: translate(-50%, -50%) rotate(0deg); }
+            100% { transform: translate(-50%, -50%) rotate(360deg); }
+        }
+        
+        @keyframes nucleusPulse {
+            0%, 100% { 
+                transform: translate(-50%, -50%) scale(1);
+                box-shadow: 
+                    0 0 40px var(--accent-glow),
+                    inset 0 0 40px rgba(0, 255, 255, 0.2);
+            }
+            50% { 
+                transform: translate(-50%, -50%) scale(1.1);
+                box-shadow: 
+                    0 0 60px var(--accent-glow),
+                    inset 0 0 60px rgba(0, 255, 255, 0.4);
+            }
+        }
+        
+        /* Voice Activity Indicator */
+        .voice-activity {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 80px;
+            height: 80px;
+            display: none;
+        }
+        
+        .voice-wave {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            border: 3px solid var(--primary-cyan);
+            border-radius: 50%;
+            animation: voiceRipple 2s ease-out infinite;
+        }
+        
+        .voice-wave:nth-child(2) { animation-delay: 0.7s; }
+        .voice-wave:nth-child(3) { animation-delay: 1.4s; }
+        
+        @keyframes voiceRipple {
+            0% { 
+                transform: scale(0);
+                opacity: 1;
+                border-width: 3px;
+            }
+            100% { 
+                transform: scale(3);
+                opacity: 0;
+                border-width: 1px;
+            }
+        }
+        
+        /* Enhanced Controls */
+        .control-panel {
+            display: flex;
+            justify-content: center;
+            gap: 25px;
+            margin: 40px 0;
+            flex-wrap: wrap;
+            animation: controlsSlide 1s ease-out 1.5s both;
+        }
+        
+        @keyframes controlsSlide {
+            0% { 
+                opacity: 0;
+                transform: translateY(40px);
+            }
+            100% { 
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        .control-btn {
+            padding: 18px 35px;
+            background: linear-gradient(135deg, rgba(0, 255, 255, 0.1), rgba(0, 128, 255, 0.1));
+            border: 2px solid rgba(0, 255, 255, 0.4);
+            border-radius: 30px;
+            color: var(--primary-cyan);
+            font-family: 'Orbitron', monospace;
+            font-weight: 600;
+            font-size: 0.95rem;
+            cursor: pointer;
+            transition: all 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+            position: relative;
+            overflow: hidden;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .control-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(0, 255, 255, 0.2), transparent);
+            transition: left 0.6s;
+        }
+        
+        .control-btn:hover {
+            border-color: var(--primary-cyan);
+            box-shadow: 0 0 30px var(--accent-glow);
+            transform: translateY(-5px) scale(1.05);
+            background: linear-gradient(135deg, rgba(0, 255, 255, 0.2), rgba(0, 128, 255, 0.2));
+        }
+        
+        .control-btn:hover::before {
+            left: 100%;
+        }
+        
+        .control-btn:active {
+            transform: translateY(-2px) scale(1.02);
+        }
+        
+        .control-btn.active {
+            background: linear-gradient(135deg, rgba(0, 255, 255, 0.3), rgba(0, 128, 255, 0.3));
+            border-color: var(--primary-cyan);
+            box-shadow: 0 0 40px var(--accent-glow);
+        }
+        
+        .control-btn.listening {
+            animation: listeningPulse 1.5s ease-in-out infinite;
+        }
+        
+        @keyframes listeningPulse {
+            0%, 100% { box-shadow: 0 0 30px var(--accent-glow); }
+            50% { box-shadow: 0 0 50px var(--accent-glow); }
+        }
+        
+        /* Chat Interface */
+        .chat-section {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            max-height: 400px;
+            animation: chatReveal 1s ease-out 2s both;
+        }
+        
+        @keyframes chatReveal {
+            0% { 
+                opacity: 0;
+                transform: translateY(50px);
+            }
+            100% { 
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        .chat-display {
+            flex: 1;
+            background: rgba(0, 20, 40, 0.4);
+            border: 1px solid rgba(0, 255, 255, 0.2);
+            border-radius: 20px;
+            padding: 25px;
+            overflow-y: auto;
+            margin-bottom: 20px;
+            backdrop-filter: blur(15px);
+            box-shadow: inset 0 0 30px rgba(0, 255, 255, 0.05);
+        }
+        
+        .message {
+            margin-bottom: 20px;
+            animation: messageAppear 0.6s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+            opacity: 0;
+            animation-fill-mode: forwards;
+        }
+        
+        @keyframes messageAppear {
+            0% { 
+                opacity: 0;
+                transform: translateX(-30px) scale(0.95);
+            }
+            100% { 
+                opacity: 1;
+                transform: translateX(0) scale(1);
+            }
+        }
+        
+        .message.user {
+            text-align: right;
+        }
+        
+        .message.ai {
+            text-align: left;
+        }
+        
+        .message-bubble {
+            display: inline-block;
+            padding: 15px 20px;
+            border-radius: 20px;
+            max-width: 75%;
+            line-height: 1.5;
+            position: relative;
+            backdrop-filter: blur(10px);
+        }
+        
+        .message.user .message-bubble {
+            background: linear-gradient(135deg, rgba(0, 255, 255, 0.15), rgba(0, 128, 255, 0.15));
+            border: 1px solid rgba(0, 255, 255, 0.3);
+            color: var(--text-primary);
+        }
+        
+        .message.ai .message-bubble {
+            background: linear-gradient(135deg, rgba(0, 255, 150, 0.15), rgba(0, 200, 255, 0.15));
+            border: 1px solid rgba(0, 255, 200, 0.3);
+            color: var(--text-primary);
+        }
+        
+        .message-bubble::before {
+            content: '';
+            position: absolute;
+            width: 0;
+            height: 0;
+        }
+        
+        .message.user .message-bubble::before {
+            right: -8px;
+            top: 15px;
+            border: 8px solid transparent;
+            border-left-color: rgba(0, 255, 255, 0.3);
+        }
+        
+        .message.ai .message-bubble::before {
+            left: -8px;
+            top: 15px;
+            border: 8px solid transparent;
+            border-right-color: rgba(0, 255, 200, 0.3);
+        }
+        
+        /* Input Section */
+        .input-section {
+            display: flex;
+            gap: 15px;
+            align-items: stretch;
+        }
+        
+        .chat-input {
+            flex: 1;
+            padding: 18px 25px;
+            background: rgba(0, 30, 60, 0.6);
+            border: 2px solid rgba(0, 255, 255, 0.2);
+            border-radius: 30px;
+            color: var(--text-primary);
+            font-family: 'Rajdhani', monospace;
+            font-size: 1.1rem;
+            font-weight: 400;
+            outline: none;
+            transition: all 0.3s ease;
+            backdrop-filter: blur(10px);
+        }
+        
+        .chat-input:focus {
+            border-color: var(--primary-cyan);
+            box-shadow: 0 0 25px var(--accent-glow);
+        }
+        
+        .chat-input::placeholder {
+            color: rgba(0, 255, 255, 0.5);
+            font-style: italic;
+        }
+        
+        .send-btn {
+            padding: 18px 30px;
+            background: linear-gradient(135deg, var(--primary-cyan), var(--primary-blue));
+            border: none;
+            border-radius: 30px;
+            color: #000;
+            font-family: 'Orbitron', monospace;
+            font-weight: 700;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .send-btn:hover {
+            transform: scale(1.05);
+            box-shadow: 0 0 25px var(--accent-glow);
+            background: linear-gradient(135deg, var(--primary-blue), var(--primary-cyan));
+        }
+        
+        .send-btn:active {
+            transform: scale(0.98);
+        }
+        
+        /* Custom Scrollbar */
+        .chat-display::-webkit-scrollbar {
+            width: 10px;
+        }
+        
+        .chat-display::-webkit-scrollbar-track {
+            background: rgba(0, 50, 100, 0.2);
+            border-radius: 10px;
+        }
+        
+        .chat-display::-webkit-scrollbar-thumb {
+            background: linear-gradient(135deg, var(--primary-cyan), var(--primary-blue));
+            border-radius: 10px;
+            border: 2px solid rgba(0, 30, 60, 0.6);
+        }
+        
+        .chat-display::-webkit-scrollbar-thumb:hover {
+            background: linear-gradient(135deg, var(--primary-blue), var(--primary-cyan));
+        }
+        
+        /* Status Messages */
+        .status-message {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            background: var(--card-bg);
+            border: 1px solid rgba(0, 255, 255, 0.3);
+            border-radius: 15px;
+            padding: 15px 20px;
+            color: var(--primary-cyan);
+            font-weight: 500;
+            backdrop-filter: blur(10px);
+            transform: translateX(400px);
+            transition: transform 0.4s ease;
+            z-index: 1000;
+        }
+        
+        .status-message.show {
+            transform: translateX(0);
+        }
+        
+        /* Responsive Design */
+        @media (max-width: 1024px) {
+            .main-interface {
+                padding: 15px;
+            }
+            
+            .status-dashboard {
+                grid-template-columns: repeat(2, 1fr);
+                gap: 15px;
+            }
+            
+            .ai-core {
+                width: 280px;
+                height: 280px;
+            }
+            
+            .control-panel {
+                gap: 15px;
+            }
+        }
+        
+        @media (max-width: 768px) {
+            .alpha-logo {
+                font-size: 2.5rem;
+            }
+            
+            .status-dashboard {
+                grid-template-columns: 1fr;
+                gap: 10px;
+            }
+            
+            .ai-core {
+                width: 240px;
+                height: 240px;
+            }
+            
+            .control-panel {
+                flex-direction: column;
+                align-items: center;
+            }
+            
+            .control-btn {
+                padding: 15px 30px;
+                font-size: 0.9rem;
+                min-width: 200px;
+            }
+            
+            .input-section {
+                flex-direction: column;
+                gap: 10px;
+            }
+            
+            .send-btn {
+                align-self: stretch;
+            }
+            
+            .chat-section {
+                max-height: 300px;
+            }
+        }
+        
+        @media (max-width: 480px) {
+            .main-interface {
+                padding: 10px;
+            }
+            
+            .alpha-logo {
+                font-size: 2rem;
+            }
+            
+            .ai-core {
+                width: 200px;
+                height: 200px;
+            }
+            
+            .message-bubble {
+                max-width: 90%;
+                padding: 12px 16px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div id="background"></div>
+    <div class="neural-grid"></div>
+    <canvas id="particles-canvas"></canvas>
+    
+    <div class="main-interface">
+        <div class="header-section">
+            <h1 class="alpha-logo">ALPHA AI</h1>
+            <p class="tagline">Advanced Learning Processing Host Assistant</p>
+            <p class="dev-credit">Developed by Animesh Paramanik</p>
+        </div>
+        
+        <div class="status-dashboard">
+            <div class="status-card">
+                <div class="status-label">SYSTEM STATUS</div>
+                <div class="status-value" id="system-status">INITIALIZING</div>
+            </div>
+            <div class="status-card">
+                <div class="status-label">WAKE WORD</div>
+                <div class="status-value" id="wake-status">INACTIVE</div>
+            </div>
+            <div class="status-card">
+                <div class="status-label">VOICE ENGINE</div>
+                <div class="status-value" id="voice-status">ENABLED</div>
+            </div>
+            <div class="status-card">
+                <div class="status-label">NEURAL LINK</div>
+                <div class="status-value" id="neural-status">CONNECTED</div>
+            </div>
+        </div>
+        
+        <div class="ai-core-container">
+            <div class="ai-core">
+                <div class="core-ring ring-1"></div>
+                <div class="core-ring ring-2"></div>
+                <div class="core-ring ring-3"></div>
+                <div class="core-nucleus"></div>
+                <div class="voice-activity" id="voice-activity">
+                    <div class="voice-wave"></div>
+                    <div class="voice-wave"></div>
+                    <div class="voice-wave"></div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="control-panel">
+            <button class="control-btn" id="wake-word-btn">Start Wake Word</button>
+            <button class="control-btn" id="listen-btn">Listen Once</button>
+            <button class="control-btn" id="clear-btn">Clear Chat</button>
+            <button class="control-btn" id="stop-btn">Stop Speaking</button>
+        </div>
+        
+        <div class="chat-section">
+            <div class="chat-display" id="chat-display">
+                <div class="message ai">
+                    <div class="message-bubble">
+                        Hello! I'm Alpha, developed by Animesh Paramanik. I'm your advanced AI assistant with voice recognition, natural language processing, and web connectivity. How can I help you today?
+                    </div>
+                </div>
+            </div>
+            <div class="input-section">
+                <input type="text" class="chat-input" id="chat-input" placeholder="Type your message or use voice commands...">
+                <button class="send-btn" id="send-btn">Send</button>
+            </div>
+        </div>
+    </div>
+    
+    <div class="status-message" id="status-message"></div>
+    
+    <script>
+        // Advanced Particle System
+        class AdvancedParticleSystem {
+            constructor() {
+                this.canvas = document.getElementById('particles-canvas');
+                this.ctx = this.canvas.getContext('2d');
+                this.particles = [];
+                this.connections = [];
+                this.mouseX = 0;
+                this.mouseY = 0;
+                
+                this.resize();
+                this.init();
+                this.animate();
+                
+                window.addEventListener('resize', () => this.resize());
+                window.addEventListener('mousemove', (e) => {
+                    this.mouseX = e.clientX;
+                    this.mouseY = e.clientY;
+                });
+            }
+            
+            resize() {
+                this.canvas.width = window.innerWidth;
+                this.canvas.height = window.innerHeight;
+            }
+            
+            init() {
+                const particleCount = Math.floor((this.canvas.width * this.canvas.height) / 8000);
+                this.particles = [];
+                
+                for (let i = 0; i < particleCount; i++) {
+                    this.particles.push({
+                        x: Math.random() * this.canvas.width,
+                        y: Math.random() * this.canvas.height,
+                        vx: (Math.random() - 0.5) * 0.8,
+                        vy: (Math.random() - 0.5) * 0.8,
+                        size: Math.random() * 3 + 1,
+                        opacity: Math.random() * 0.6 + 0.2,
+                        hue: 180 + Math.random() * 40 // Cyan to blue range
+                    });
+                }
+            }
+            
+            animate() {
+                this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+                
+                // Update and draw particles
+                this.particles.forEach((particle, index) => {
+                    // Mouse interaction
+                    const dx = this.mouseX - particle.x;
+                    const dy = this.mouseY - particle.y;
+                    const distance = Math.sqrt(dx * dx + dy * dy);
+                    
+                    if (distance < 150) {
+                        const force = (150 - distance) / 150;
+                        particle.vx += dx * force * 0.0001;
+                        particle.vy += dy * force * 0.0001;
+                    }
+                    
+                    // Update position
+                    particle.x += particle.vx;
+                    particle.y += particle.vy;
+                    
+                    // Boundary conditions
+                    if (particle.x < 0 || particle.x > this.canvas.width) particle.vx *= -1;
+                    if (particle.y < 0 || particle.y > this.canvas.height) particle.vy *= -1;
+                    
+                    particle.x = Math.max(0, Math.min(this.canvas.width, particle.x));
+                    particle.y = Math.max(0, Math.min(this.canvas.height, particle.y));
+                    
+                    // Draw particle
+                    this.ctx.beginPath();
+                    this.ctx.arc(particle.x, particle.y, particle.size, 0, Math.PI * 2);
+                    
+                    const gradient = this.ctx.createRadialGradient(
+                        particle.x, particle.y, 0,
+                        particle.x, particle.y, particle.size
+                    );
+                    gradient.addColorStop(0, `hsla(${particle.hue}, 100%, 50%, ${particle.opacity})`);
+                    gradient.addColorStop(1, `hsla(${particle.hue}, 100%, 50%, 0)`);
+                    
+                    this.ctx.fillStyle = gradient;
+                    this.ctx.fill();
+                });
+                
+                // Draw connections
+                for (let i = 0; i < this.particles.length; i++) {
+                    for (let j = i + 1; j < this.particles.length; j++) {
+                        const dx = this.particles[i].x - this.particles[j].x;
+                        const dy = this.particles[i].y - this.particles[j].y;
+                        const distance = Math.sqrt(dx * dx + dy * dy);
+                        
+                        if (distance < 120) {
+                            const opacity = (120 - distance) / 120 * 0.15;
+                            
+                            this.ctx.beginPath();
+                            this.ctx.moveTo(this.particles[i].x, this.particles[i].y);
+                            this.ctx.lineTo(this.particles[j].x, this.particles[j].y);
+                            
+                            const gradient = this.ctx.createLinearGradient(
+                                this.particles[i].x, this.particles[i].y,
+                                this.particles[j].x, this.particles[j].y
+                            );
+                            gradient.addColorStop(0, `hsla(${this.particles[i].hue}, 100%, 50%, ${opacity})`);
+                            gradient.addColorStop(1, `hsla(${this.particles[j].hue}, 100%, 50%, ${opacity})`);
+                            
+                            this.ctx.strokeStyle = gradient;
+                            this.ctx.lineWidth = 1;
+                            this.ctx.stroke();
+                        }
+                    }
+                }
+                
+                requestAnimationFrame(() => this.animate());
+            }
+        }
+        
+        // Enhanced AI Interface Controller
+        class AlphaInterface {
+            constructor() {
+                this.socket = io();
+                this.isConnected = false;
+                this.isListening = false;
+                this.currentStatus = 'INITIALIZING';
+                
+                this.initializeElements();
+                this.setupEventListeners();
+                this.setupSocketEvents();
+                
+                // Initialize particles
+                new AdvancedParticleSystem();
+            }
+            
+            initializeElements() {
+                this.chatDisplay = document.getElementById('chat-display');
+                this.chatInput = document.getElementById('chat-input');
+                this.sendBtn = document.getElementById('send-btn');
+                this.wakeWordBtn = document.getElementById('wake-word-btn');
+                this.listenBtn = document.getElementById('listen-btn');
+                this.clearBtn = document.getElementById('clear-btn');
+                this.stopBtn = document.getElementById('stop-btn');
+                this.voiceActivity = document.getElementById('voice-activity');
+                this.systemStatus = document.getElementById('system-status');
+                this.wakeStatus = document.getElementById('wake-status');
+                this.voiceStatus = document.getElementById('voice-status');
+                this.neuralStatus = document.getElementById('neural-status');
+                this.statusMessage = document.getElementById('status-message');
+            }
+            
+            setupEventListeners() {
+                this.sendBtn.addEventListener('click', () => this.sendMessage());
+                this.chatInput.addEventListener('keypress', (e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        this.sendMessage();
+                    }
+                });
+                
+                this.wakeWordBtn.addEventListener('click', () => this.toggleWakeWord());
+                this.listenBtn.addEventListener('click', () => this.listenOnce());
+                this.clearBtn.addEventListener('click', () => this.clearChat());
+                this.stopBtn.addEventListener('click', () => this.stopSpeaking());
+            }
+            
+            setupSocketEvents() {
+                this.socket.on('connect', () => {
+                    this.isConnected = true;
+                    this.updateSystemStatus('READY');
+                    this.neuralStatus.textContent = 'CONNECTED';
+                    this.showStatusMessage('Connected to Alpha AI Core', 'success');
+                });
+                
+                this.socket.on('disconnect', () => {
+                    this.isConnected = false;
+                    this.updateSystemStatus('DISCONNECTED');
+                    this.neuralStatus.textContent = 'DISCONNECTED';
+                    this.showStatusMessage('Disconnected from Alpha AI Core', 'error');
+                });
+                
+                this.socket.on('status_update', (status) => {
+                    this.updateSystemStatus(status.status);
+                });
+                
+                this.socket.on('message_received', (data) => {
+                    this.addMessage(data.sender, data.message);
+                });
+                
+                this.socket.on('wake_word_status', (data) => {
+                    this.wakeStatus.textContent = data.active ? 'ACTIVE' : 'INACTIVE';
+                    this.wakeWordBtn.textContent = data.active ? 'Stop Wake Word' : 'Start Wake Word';
+                    this.wakeWordBtn.classList.toggle('active', data.active);
+                });
+                
+                this.socket.on('wake_word_detected', (data) => {
+                    this.showStatusMessage(`Wake word detected: "${data.wake_word}"`, 'success');
+                    this.addMessage('system', `Wake word detected: "${data.wake_word}"`);
+                });
+                
+                this.socket.on('listening_started', () => {
+                    this.isListening = true;
+                    this.voiceActivity.style.display = 'block';
+                    this.listenBtn.classList.add('listening');
+                    this.showStatusMessage('Listening for voice command...', 'info');
+                });
+                
+                this.socket.on('listening_ready', () => {
+                    this.showStatusMessage('Ready - Please speak now', 'info');
+                });
+                
+                this.socket.on('processing_audio', () => {
+                    this.showStatusMessage('Processing your voice command...', 'info');
+                });
+                
+                this.socket.on('listening_stopped', () => {
+                    this.isListening = false;
+                    this.voiceActivity.style.display = 'none';
+                    this.listenBtn.classList.remove('listening');
+                });
+                
+                this.socket.on('listening_failed', (data) => {
+                    this.showStatusMessage(`Listening failed: ${data.error}`, 'error');
+                });
+                
+                this.socket.on('conversation_cleared', () => {
+                    this.chatDisplay.innerHTML = `
+                        <div class="message ai">
+                            <div class="message-bubble">
+                                Chat cleared. How can I help you?
+                            </div>
+                        </div>
+                    `;
+                });
+                
+                this.socket.on('conversation_history', (history) => {
+                    this.chatDisplay.innerHTML = '';
+                    history.forEach(entry => {
+                        this.addMessage(entry.sender, entry.message, false);
+                    });
+                });
+            }
+            
+            sendMessage() {
+                const message = this.chatInput.value.trim();
+                if (message && this.isConnected) {
+                    this.socket.emit('send_message', { message: message });
+                    this.chatInput.value = '';
+                    this.chatInput.focus();
+                }
+            }
+            
+            addMessage(sender, content, animate = true) {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = `message ${sender}`;
+                
+                const bubbleDiv = document.createElement('div');
+                bubbleDiv.className = 'message-bubble';
+                bubbleDiv.textContent = content;
+                
+                messageDiv.appendChild(bubbleDiv);
+                
+                if (animate) {
+                    messageDiv.style.animationDelay = '0s';
+                }
+                
+                this.chatDisplay.appendChild(messageDiv);
+                this.chatDisplay.scrollTop = this.chatDisplay.scrollHeight;
+                
+                // Add smooth scroll effect
+                this.chatDisplay.scrollTo({
+                    top: this.chatDisplay.scrollHeight,
+                    behavior: 'smooth'
+                });
+            }
+            
+            toggleWakeWord() {
+                if (this.isConnected) {
+                    this.socket.emit('toggle_wake_word');
+                }
+            }
+            
+            listenOnce() {
+                if (this.isConnected && !this.isListening) {
+                    this.socket.emit('listen_once');
+                }
+            }
+            
+            clearChat() {
+                if (this.isConnected) {
+                    this.socket.emit('clear_chat');
+                }
+            }
+            
+            stopSpeaking() {
+                if (this.isConnected) {
+                    this.socket.emit('stop_speaking');
+                    this.showStatusMessage('Speech stopped', 'info');
+                }
+            }
+            
+            updateSystemStatus(status) {
+                this.currentStatus = status;
+                this.systemStatus.textContent = status;
+                
+                // Visual feedback based on status
+                const coreNucleus = document.querySelector('.core-nucleus');
+                if (status === 'PROCESSING') {
+                    coreNucleus.style.animationDuration = '1s';
+                } else if (status === 'LISTENING') {
+                    coreNucleus.style.animationDuration = '0.5s';
+                } else {
+                    coreNucleus.style.animationDuration = '2s';
+                }
+            }
+            
+            showStatusMessage(message, type = 'info') {
+                this.statusMessage.textContent = message;
+                this.statusMessage.className = `status-message ${type} show`;
+                
+                setTimeout(() => {
+                    this.statusMessage.classList.remove('show');
+                }, 3000);
+            }
+        }
+        
+        // Initialize when DOM is loaded
+        document.addEventListener('DOMContentLoaded', () => {
+            new AlphaInterface();
+        });
+        
+        // Add cursor trail effect
+        document.addEventListener('mousemove', (e) => {
+            const trail = document.createElement('div');
+            trail.style.cssText = `
+                position: fixed;
+                left: ${e.clientX - 2}px;
+                top: ${e.clientY - 2}px;
+                width: 4px;
+                height: 4px;
+                background: radial-gradient(circle, rgba(0, 255, 255, 0.8) 0%, transparent 70%);
+                border-radius: 50%;
+                pointer-events: none;
+                z-index: 9999;
+                animation: trailFade 1.5s ease-out forwards;
+            `;
+            
+            document.body.appendChild(trail);
+            
+            setTimeout(() => {
+                if (trail.parentNode) {
+                    trail.parentNode.removeChild(trail);
+                }
+            }, 1500);
+        });
+        
+        // Dynamic background color shifting
+        let hueShift = 0;
+        setInterval(() => {
+            hueShift = (hueShift + 0.5) % 360;
+            document.documentElement.style.setProperty(
+                '--dynamic-hue', 
+                `hsl(${180 + Math.sin(hueShift * Math.PI / 180) * 20}, 100%, 50%)`
+            );
+        }, 100);
+        
+        // Add dynamic styles
+        const dynamicStyle = document.createElement('style');
+        dynamicStyle.textContent = `
+            @keyframes trailFade {
+                0% { transform: scale(1); opacity: 1; }
+                100% { transform: scale(4); opacity: 0; }
+            }
+            
+            .message-bubble {
+                transition: all 0.3s ease;
+            }
+            
+            .message-bubble:hover {
+                transform: scale(1.02);
+                box-shadow: 0 5px 15px rgba(0, 255, 255, 0.2);
+            }
+            
+            .core-nucleus {
+                background: radial-gradient(circle, var(--dynamic-hue, #00ffff) 0%, rgba(0, 255, 255, 0.3) 70%, transparent 100%);
+            }
+        `;
+        document.head.appendChild(dynamicStyle);
+    </script>
+</body>
+</html>'''
+    
+    def run(self, host='127.0.0.1', port=5000, debug=False):
+        """Run the Flask application"""
+        try:
+            print(f"\n{'='*60}")
+            print("🚀 ALPHA AI - ADVANCED NEURAL INTERFACE")
+            print("📡 Developed by Animesh Paramanik")
+            print(f"{'='*60}")
+            print(f"🌐 Interface: http://{host}:{port}")
+            print(f"🎤 Wake Words: 'alpha', 'hey alpha'")
+            print(f"🔊 Voice Engine: {'Enabled' if self.tts_engine else 'Disabled'}")
+            print(f"🧠 AI Model: GPT-4o-mini")
+            print(f"{'='*60}")
+            print("✨ Features Loaded:")
+            print("   • Advanced Particle System")
+            print("   • Real-time Voice Recognition")
+            print("   • Wake Word Detection")
+            print("   • Neural Network Visualization")
+            print("   • WebSocket Communication")
+            print("   • OpenAI Integration")
+            print("   • Dynamic Status Updates")
+            print(f"{'='*60}\n")
+            
+            self.socketio.run(
+                self.app, 
+                host=host, 
+                port=port, 
+                debug=debug,
+                allow_unsafe_werkzeug=True
+            )
+        except KeyboardInterrupt:
+            print("\n🛑 Alpha AI shutting down...")
+            self.cleanup()
+        except Exception as e:
+            logging.error(f"Failed to start server: {e}")
+            print(f"❌ Error starting Alpha AI: {e}")
+    
+    def cleanup(self):
+        """Cleanup resources"""
+        try:
+            if self.is_wake_word_active:
+                self.wake_word_detector.stop_detection()
+            if self.tts_engine:
+                self.tts_engine.stop()
+        except Exception as e:
+            logging.error(f"Cleanup error: {e}")
+
+def main():
+    """Main function to start Alpha AI"""
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Alpha AI - Advanced Neural Interface')
+    parser.add_argument('--host', default='127.0.0.1', help='Host to bind to (default: 127.0.0.1)')
+    parser.add_argument('--port', type=int, default=5000, help='Port to bind to (default: 5000)')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    args = parser.parse_args()
+    
+    # Check for required environment variables
+    if not os.getenv("OPENAI_API_KEY"):
+        print("❌ ERROR: OPENAI_API_KEY not found!")
+        print("📝 Please create a .env file with your OpenAI API key:")
+        print("   OPENAI_API_KEY=your_api_key_here")
+        print("\n🔑 Get your API key from: https://platform.openai.com/api-keys")
+        return
+    
+    try:
+        # Create and run Alpha AI
+        alpha = EnhancedAlphaAI()
+        alpha.run(host=args.host, port=args.port, debug=args.debug)
+    except Exception as e:
+        print(f"❌ Fatal Error: {e}")
+        logging.error(f"Fatal error in main: {e}")
+
+if __name__ == '__main__':
+    main()
